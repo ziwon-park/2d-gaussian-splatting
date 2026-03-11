@@ -6,8 +6,103 @@
 
 This repo contains the official implementation for the paper "2D Gaussian Splatting for Geometrically Accurate Radiance Fields". Our work represents a scene with a set of 2D oriented disks (surface elements) and rasterizes the surfels with [perspective correct differentiable raseterization](https://colab.research.google.com/drive/1qoclD7HJ3-o0O1R8cvV3PxLhoDCMsH8W?usp=sharing). Our work also develops regularizations that enhance the reconstruction quality. We also devise meshing approaches for Gaussian splatting.
 
+---
 
-## ⭐ New Features 
+## 🏷️ Local Modifications (2dgs_planner)
+
+> 이 서브모듈은 `2dgs_planner` 프로젝트에서 사용하기 위해 아래 파일들이 수정되었음. 
+
+### 변경 파일 요약
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `scene/gaussian_model.py` | Per-surfel semantic logits 지원 추가 |
+| `gaussian_renderer/render_semantic.py` | Multi-pass semantic 렌더링 (신규 파일) |
+| `scene/dataset_readers.py` | PIL 파일  |
+| `utils/system_utils.py` | `searchForMaxIteration` 안정성 개선 |
+
+### 1. `scene/gaussian_model.py` — Semantic Logits
+
+`GaussianModel`에 per-surfel semantic logit 파라미터를 추가. 
+
+**새 속성:**
+- `_semantic_logits`: `nn.Parameter` (N, C) — surfel별 C-class logit 벡터
+- `_num_semantic_classes`: `int` — 클래스 수
+
+**새 메서드:**
+
+```python
+# 초기화 (3가지 모드)
+model.create_semantic(num_classes=8)                         # zero init
+model.create_semantic(num_classes=8, init_labels=labels)     # one-hot (hard label)
+model.create_semantic(num_classes=8, init_votes=votes)       # log-prob (soft votes)
+
+# 저장/로드
+model.save_semantic("semantic_logits.pt")
+# → {'semantic_logits': (N,C) tensor, 'num_classes': int}
+
+model.load_semantic("semantic_logits.pt")
+# dict 또는 raw tensor 모두 호환
+
+# 읽기
+logits = model.get_semantic_logits  # (N, C) nn.Parameter
+```
+
+**기존 메서드 수정:**
+- `prune_points(mask)`: semantic logits도 함께 pruning
+- `densification_postfix(...)`: `new_semantic_logits` 파라미터 추가, concat 처리
+- `densify_and_split(...)`: split된 포인트에 semantic logits 복제
+- `densify_and_clone(...)`: clone된 포인트에 semantic logits 복사
+
+### 2. `gaussian_renderer/render_semantic.py` — Semantic Rendering
+
+diff-surfel-rasterization CUDA 커널은 3채널 고정이므로, C-class semantic logits를
+**ceil(C/3) 패스**로 나누어 렌더링.
+
+```python
+from gaussian_renderer.render_semantic import render_semantic
+
+result = render_semantic(camera, gaussians, pipe, bg_color)
+# result['semantic_logits']  — (C, H, W) raw logits
+# result['semantic_probs']   — (C, H, W) softmax probabilities
+# result['semantic_labels']  — (H, W) argmax class ID
+```
+
+**동작 방식:**
+1. `_semantic_logits` (N, C)를 3채널씩 슬라이스 → `override_color`로 전달
+2. 각 패스에서 rasterizer가 alpha-blending으로 3채널 이미지 렌더링
+3. 모든 패스를 concat → (C, H, W) logits
+4. CUDA 수정 없이 완전 미분 가능
+
+### 3. `scene/dataset_readers.py` — 파일 핸들 릭 수정
+
+```python
+# Before (파일 핸들이 열린 채 유지 → 대량 이미지에서 "Too many open files" 에러)
+image = Image.open(image_path)
+
+# After (즉시 메모리에 복사하고 핸들 해제)
+with Image.open(image_path) as img:
+    image = img.copy()
+```
+
+1000장 이상의 이미지가 있는 데이터셋에서 `OSError: [Errno 24] Too many open files` 방지.
+
+### 4. `utils/system_utils.py` — searchForMaxIteration 안정성
+
+```python
+# Before (point_cloud/ 안에 iteration_* 외 파일이 있으면 crash)
+saved_iters = [int(fname.split("_")[-1]) for fname in os.listdir(folder)]
+
+# After (iteration_ 접두사 필터링)
+saved_iters = [int(fname.split("_")[-1]) for fname in os.listdir(folder)
+               if fname.startswith("iteration_")]
+```
+
+`point_cloud/` 디렉토리에 `point_cloud.ply` 등 다른 파일이 있어도 정상 동작.
+
+---
+
+## ⭐ New Features
 - 2025/12/19: Our work is featured in an in-depth blog post on [LearnOpenCV](https://learnopencv.com/)! Thanks to [Shubham Anand](https://www.linkedin.com/in/shubham-anand-91a10b211/).
 - 2024/07/20: Web-based viewer [GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D) also supports 2DGS. Thanks to [Mark Kellogg](https://github.com/mkkellogg).
 - 2024/07/19: [Colab Notebook](https://github.com/atakan-topaloglu/2d_gaussian_splatting_colab) is supported! Thanks to [atakan-topaloglu](https://github.com/atakan-topaloglu)
