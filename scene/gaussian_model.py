@@ -56,6 +56,8 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self._semantic_logits = None
+        self._num_semantic_classes = 0
         self.setup_functions()
 
     def capture(self):
@@ -113,7 +115,59 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
+    @property
+    def get_semantic_logits(self):
+        return self._semantic_logits
+
+    def create_semantic(self, num_classes=8, init_labels=None, init_votes=None):
+        """Initialize semantic logits for each surfel.
+
+        Args:
+            num_classes: Number of semantic classes.
+            init_labels: (N,) tensor of class labels for one-hot initialization.
+            init_votes: (N, num_classes) tensor of vote counts for soft initialization.
+        """
+        N = self._xyz.shape[0]
+        self._num_semantic_classes = num_classes
+
+        if init_votes is not None:
+            vote_sum = init_votes.sum(dim=1, keepdim=True).clamp(min=1)
+            probs = (init_votes / vote_sum).to(device="cuda", dtype=torch.float32)
+            probs = probs.clamp(min=1e-3, max=1.0)
+            probs = probs / probs.sum(dim=1, keepdim=True)
+            logits = torch.log(probs)
+            logits = logits - logits.mean(dim=1, keepdim=True)
+        elif init_labels is not None:
+            init_labels = init_labels.to(device="cuda", dtype=torch.long)
+            logits = torch.zeros((N, num_classes), dtype=torch.float32, device="cuda")
+            logits.scatter_(1, init_labels.unsqueeze(1), 3.0)
+        else:
+            logits = torch.zeros((N, num_classes), dtype=torch.float32, device="cuda")
+
+        self._semantic_logits = nn.Parameter(logits.requires_grad_(True))
+
+    def save_semantic(self, path):
+        """Save semantic logits to file."""
+        if self._semantic_logits is not None:
+            torch.save({
+                'semantic_logits': self._semantic_logits.detach().cpu(),
+                'num_classes': self._num_semantic_classes,
+            }, path)
+
+    def load_semantic(self, path):
+        """Load semantic logits from file."""
+        data = torch.load(path, map_location="cuda")
+        if isinstance(data, dict):
+            self._num_semantic_classes = data['num_classes']
+            logits = data['semantic_logits']
+        else:
+            logits = data
+            self._num_semantic_classes = logits.shape[-1] if logits.dim() > 1 else 0
+        self._semantic_logits = nn.Parameter(
+            logits.to(device="cuda", dtype=torch.float32).requires_grad_(True)
+        )
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
@@ -303,6 +357,11 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        if self._semantic_logits is not None:
+            self._semantic_logits = nn.Parameter(
+                self._semantic_logits[valid_points_mask].requires_grad_(True)
+            )
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -325,7 +384,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic_logits=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -344,6 +403,11 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        if self._semantic_logits is not None and new_semantic_logits is not None:
+            self._semantic_logits = nn.Parameter(
+                torch.cat([self._semantic_logits.data, new_semantic_logits], dim=0).requires_grad_(True)
+            )
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -366,7 +430,11 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        new_semantic = None
+        if self._semantic_logits is not None:
+            new_semantic = self._semantic_logits.data[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -384,7 +452,11 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        new_semantic = None
+        if self._semantic_logits is not None:
+            new_semantic = self._semantic_logits.data[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
